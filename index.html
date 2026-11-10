@@ -1,0 +1,481 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Draw With Your Hand</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Great+Vibes&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --burgundy: #6D1A2D;
+    --white: #FFFFFF;
+    --beige: #FAF5F2;
+    --gold: #C9A86A;
+    --shadow: 0 10px 30px rgba(109, 26, 45, 0.12), 0 2px 8px rgba(109, 26, 45, 0.08);
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; min-height: 100%; background: var(--beige); color: var(--burgundy); }
+  body {
+    font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+    min-height: 100vh;
+    min-height: 100dvh;
+    padding: env(safe-area-inset-top, 0) 0 env(safe-area-inset-bottom, 0);
+  }
+  .hidden { display: none !important; }
+
+  .screen {
+    min-height: 100vh;
+    min-height: 100dvh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 20px 16px;
+    text-align: center;
+  }
+
+  /* Start screen */
+  h1 {
+    font-family: 'Great Vibes', 'Snell Roundhand', cursive;
+    font-weight: 400;
+    font-size: clamp(3.4rem, 13vw, 6rem);
+    line-height: 1.05;
+    margin: 0;
+    color: var(--burgundy);
+  }
+  .rule { width: 72px; height: 1px; background: var(--gold); margin: 20px auto; }
+  .subtitle { font-size: clamp(1rem, 3.6vw, 1.15rem); margin: 0 0 32px; color: var(--burgundy); opacity: 0.85; max-width: 32ch; }
+  .error { min-height: 1.4em; margin: 16px 0 0; font-size: 0.9rem; color: var(--burgundy); max-width: 42ch; }
+
+  .btn {
+    font-family: 'Inter', sans-serif;
+    font-size: 0.95rem;
+    font-weight: 500;
+    padding: 13px 26px;
+    border-radius: 999px;
+    border: 1.5px solid var(--burgundy);
+    cursor: pointer;
+    transition: transform 0.15s ease, box-shadow 0.15s ease;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .btn:hover { transform: translateY(-1px); box-shadow: var(--shadow); }
+  .btn:active { transform: translateY(0); }
+  .btn:focus-visible { outline: 2px solid var(--gold); outline-offset: 3px; }
+  .btn:disabled { opacity: 0.7; cursor: default; transform: none; box-shadow: none; }
+  .btn-primary { background: var(--burgundy); color: var(--white); }
+
+  /* Camera screen: camera only */
+  #app { position: fixed; inset: 0; min-height: 0; padding: 0; background: #000; overflow: hidden; }
+  .stage { position: fixed; inset: 0; width: 100vw; height: 100vh; height: 100dvh; background: #000; overflow: hidden; touch-action: none; }
+  .stage video, .stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  .stage video { object-fit: cover; transform: scaleX(-1); }
+  .stage canvas { pointer-events: none; }
+  .status {
+    position: absolute; left: 50%; top: calc(env(safe-area-inset-top, 0px) + 14px); transform: translateX(-50%);
+    padding: 6px 14px; border-radius: 999px; font-size: 0.8rem; color: #e6ffff;
+    background: rgba(0, 0, 0, 0.55); border: 1px solid rgba(0, 229, 255, 0.5);
+  }
+  @media (prefers-reduced-motion: reduce) { .btn { transition: none; } }
+</style>
+</head>
+<body>
+
+<main id="start" class="screen">
+  <h1>Draw With Your Hand</h1>
+  <div class="rule"></div>
+  <p class="subtitle">Open your palm to light up neon wires</p>
+  <button id="openCam" class="btn btn-primary" type="button">Open Camera</button>
+  <p id="err" class="error" role="alert"></p>
+</main>
+
+<main id="app" class="screen hidden">
+  <div id="stage" class="stage">
+    <video id="video" autoplay muted playsinline></video>
+    <canvas id="neon"></canvas>
+    <div id="status" class="status">Loading hand tracking</div>
+  </div>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+<script>
+(function () {
+  'use strict';
+
+  var $ = function (id) { return document.getElementById(id); };
+  var startEl = $('start'), appEl = $('app'), openBtn = $('openCam'), errEl = $('err');
+  var stage = $('stage'), video = $('video'), neonCv = $('neon'), statusEl = $('status');
+  var nctx = neonCv.getContext('2d');
+
+  var W = 0, H = 0, DPR = 1;
+  var hands = null, running = false, busy = false, ready = false;
+
+  /* ---------- Layout ---------- */
+  function layout() {
+    var r = stage.getBoundingClientRect();
+    if (!r.width || !r.height) return;
+    DPR = 1;
+    W = r.width; H = r.height;
+    neonCv.width = Math.round(W * DPR);
+    neonCv.height = Math.round(H * DPR);
+  }
+  if (window.ResizeObserver) new ResizeObserver(layout).observe(stage);
+  window.addEventListener('resize', layout);
+
+  /* Map a normalized video point to stage pixels (video is object-fit: cover and mirrored) */
+  function cover() {
+    var vw = video.videoWidth || 4, vh = video.videoHeight || 3;
+    var sc = Math.max(W / vw, H / vh);
+    return { vw: vw, vh: vh, sc: sc, ox: (W - vw * sc) / 2, oy: (H - vh * sc) / 2 };
+  }
+  function toScreen(lm) {
+    var c = cover(), out = new Array(lm.length);
+    for (var i = 0; i < lm.length; i++) {
+      out[i] = { x: W - (c.ox + lm[i].x * c.vw * c.sc), y: c.oy + lm[i].y * c.vh * c.sc };
+    }
+    return out;
+  }
+
+  /* ---------- Open palm detection ---------- */
+  function dist(a, b, ratio) {
+    var dx = (a.x - b.x) * ratio, dy = a.y - b.y;
+    return Math.sqrt(dx * dx + dy * dy);
+  }
+  function isOpenPalm(lm) {
+    var ratio = (video.videoWidth || 4) / (video.videoHeight || 3);
+    function ext(tip, pip) { return dist(lm[0], lm[tip], ratio) > dist(lm[0], lm[pip], ratio) * 1.15; }
+    return ext(8, 6) && ext(12, 10) && ext(16, 14) && ext(20, 18);
+  }
+
+  /* ---------- Hand slots (left-most / right-most hand) ---------- */
+  var FINGERS = [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12], [13, 14, 15, 16], [17, 18, 19, 20]];
+  var PALM = [[0, 1], [0, 5], [5, 9], [9, 13], [13, 17], [0, 17]];
+  var TIPS = [4, 8, 12, 16, 20];
+
+  function makeRope(n) {
+    var p = [], q = [];
+    for (var i = 0; i < n; i++) { p.push({ x: 0, y: 0 }); q.push({ x: 0, y: 0 }); }
+    return { n: n, p: p, q: q };
+  }
+  function ropeReset(r, a, b) {
+    for (var i = 0; i < r.n; i++) {
+      var t = i / (r.n - 1);
+      var x = a.x + (b.x - a.x) * t, y = a.y + (b.y - a.y) * t;
+      r.p[i].x = r.q[i].x = x; r.p[i].y = r.q[i].y = y;
+    }
+  }
+  /* Verlet rope: start pinned to a, end pinned to b (or free when b is null) */
+  function ropeStep(r, a, b, total, dt, g) {
+    var n = r.n, i, p = r.p, q = r.q, damp = 0.975;
+    for (i = 1; i < n; i++) {
+      if (i === n - 1 && b) continue;
+      var vx = (p[i].x - q[i].x) * damp, vy = (p[i].y - q[i].y) * damp;
+      q[i].x = p[i].x; q[i].y = p[i].y;
+      p[i].x += vx;
+      p[i].y += vy + g * dt * dt;
+    }
+    q[0].x = p[0].x = a.x; q[0].y = p[0].y = a.y;
+    if (b) { q[n - 1].x = p[n - 1].x = b.x; q[n - 1].y = p[n - 1].y = b.y; }
+    var seg = total / (n - 1);
+    for (var it = 0; it < 8; it++) {
+      for (i = 0; i < n - 1; i++) {
+        var dx = p[i + 1].x - p[i].x, dy = p[i + 1].y - p[i].y;
+        var d = Math.sqrt(dx * dx + dy * dy) || 0.0001;
+        var diff = (d - seg) / d;
+        var wa = i === 0 ? 0 : 1, wb = (i + 1 === n - 1 && b) ? 0 : 1, s = wa + wb;
+        if (!s) continue;
+        p[i].x += dx * diff * wa / s; p[i].y += dy * diff * wa / s;
+        p[i + 1].x -= dx * diff * wb / s; p[i + 1].y -= dy * diff * wb / s;
+      }
+      p[0].x = a.x; p[0].y = a.y;
+      if (b) { p[n - 1].x = b.x; p[n - 1].y = b.y; }
+    }
+  }
+
+  function makeSlot() {
+    var dang = [];
+    for (var i = 0; i < 5; i++) dang.push(makeRope(8));
+    return { pts: null, open: 0, want: 0, dang: dang, dInit: false };
+  }
+  var slots = [makeSlot(), makeSlot()];
+  var cables = [];
+  for (var ci = 0; ci < 5; ci++) cables.push(makeRope(18));
+  var cInit = false;
+
+  function setSlot(s, lm) {
+    var np = toScreen(lm);
+    if (!s.pts || s.open < 0.05) s.pts = np;
+    else for (var i = 0; i < np.length; i++) {
+      s.pts[i].x += (np[i].x - s.pts[i].x) * 0.85;
+      s.pts[i].y += (np[i].y - s.pts[i].y) * 0.85;
+    }
+    s.want = isOpenPalm(lm) ? 1 : 0;
+  }
+
+  function updateSlots(lms) {
+    if (!W) return;
+    var n = Math.min(lms.length, 2);
+    if (n === 0) { slots[0].want = 0; slots[1].want = 0; return; }
+    if (n === 1) {
+      var np = toScreen(lms[0]), idx = 0;
+      var d0 = slots[0].pts ? Math.hypot(slots[0].pts[0].x - np[0].x, slots[0].pts[0].y - np[0].y) : 1e9;
+      var d1 = slots[1].pts ? Math.hypot(slots[1].pts[0].x - np[0].x, slots[1].pts[0].y - np[0].y) : 1e9;
+      if (d1 < d0) idx = 1;
+      setSlot(slots[idx], lms[0]);
+      slots[1 - idx].want = 0;
+      return;
+    }
+    var a = lms[0], b = lms[1];
+    if ((1 - a[0].x) > (1 - b[0].x)) { var tmp = a; a = b; b = tmp; }
+    setSlot(slots[0], a);
+    setSlot(slots[1], b);
+  }
+
+  /* ---------- Neon drawing ---------- */
+  var NEON_DEEP = '#00b8ff', NEON = '#00e5ff', NEON_CORE = '#e6ffff';
+
+  function neonStroke(p, u, alpha, wm, smooth) {
+    if (p.length < 2) return;
+    nctx.beginPath();
+    nctx.moveTo(p[0].x, p[0].y);
+    if (smooth && p.length > 2) {
+      for (var i = 1; i < p.length - 1; i++) {
+        nctx.quadraticCurveTo(p[i].x, p[i].y, (p[i].x + p[i + 1].x) / 2, (p[i].y + p[i + 1].y) / 2);
+      }
+      nctx.lineTo(p[p.length - 1].x, p[p.length - 1].y);
+    } else {
+      for (var j = 1; j < p.length; j++) nctx.lineTo(p[j].x, p[j].y);
+    }
+    nctx.globalAlpha = alpha * 0.12; nctx.strokeStyle = NEON_DEEP; nctx.lineWidth = 14 * u * wm; nctx.stroke();
+    nctx.globalAlpha = alpha * 0.25; nctx.strokeStyle = NEON; nctx.lineWidth = 7 * u * wm; nctx.stroke();
+    nctx.globalAlpha = alpha * 0.55; nctx.strokeStyle = NEON; nctx.lineWidth = 3.4 * u * wm; nctx.stroke();
+    nctx.globalAlpha = alpha; nctx.strokeStyle = NEON_CORE; nctx.lineWidth = 1.6 * u * wm; nctx.stroke();
+  }
+
+  function neonDot(x, y, r, alpha) {
+    nctx.fillStyle = NEON;
+    nctx.globalAlpha = alpha * 0.25;
+    nctx.beginPath();
+    nctx.arc(x, y, r * 2.4, 0, Math.PI * 2);
+    nctx.fill();
+    nctx.fillStyle = NEON_CORE;
+    nctx.globalAlpha = alpha;
+    nctx.beginPath();
+    nctx.arc(x, y, r, 0, Math.PI * 2);
+    nctx.fill();
+  }
+
+  function pointAlong(chain, f) {
+    var lens = [], total = 0, i;
+    for (i = 0; i < chain.length - 1; i++) {
+      var l = Math.hypot(chain[i + 1].x - chain[i].x, chain[i + 1].y - chain[i].y);
+      lens.push(l); total += l;
+    }
+    var d = f * total;
+    for (i = 0; i < lens.length; i++) {
+      if (d <= lens[i] || i === lens.length - 1) {
+        var k = lens[i] ? Math.min(d / lens[i], 1) : 0;
+        return { x: chain[i].x + (chain[i + 1].x - chain[i].x) * k, y: chain[i].y + (chain[i + 1].y - chain[i].y) * k };
+      }
+      d -= lens[i];
+    }
+    return chain[chain.length - 1];
+  }
+
+  function drawHandWires(s, t, u) {
+    var P = s.pts, a = s.open, i, j;
+    for (i = 0; i < PALM.length; i++) neonStroke([P[PALM[i][0]], P[PALM[i][1]]], u, a * 0.7, 0.6);
+    for (i = 0; i < FINGERS.length; i++) {
+      var chain = [P[0]];
+      for (j = 0; j < FINGERS[i].length; j++) chain.push(P[FINGERS[i][j]]);
+      neonStroke(chain, u, a, 1);
+      for (j = 1; j < chain.length; j++) neonDot(chain[j].x, chain[j].y, (j === chain.length - 1 ? 3.2 : 2.2) * u, a);
+      var sp = pointAlong(chain, (t * 0.6 + i * 0.21) % 1);
+      neonDot(sp.x, sp.y, 2.4 * u, a);
+    }
+    /* loose wire ends hanging from each fingertip */
+    for (i = 0; i < 5; i++) {
+      var rp = s.dang[i].p;
+      neonStroke(rp, u, a * 0.9, 0.75, true);
+      neonDot(rp[rp.length - 1].x, rp[rp.length - 1].y, 2.4 * u, a);
+    }
+  }
+
+  var prevT = performance.now();
+  function frame(now) {
+    requestAnimationFrame(frame);
+    var dt = Math.min((now - prevT) / 1000, 0.1);
+    prevT = now;
+    if (!W) return;
+
+    nctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    nctx.clearRect(0, 0, W, H);
+
+    var k = 1 - Math.exp(-dt * 10), i, j;
+    for (i = 0; i < 2; i++) slots[i].open += (slots[i].want - slots[i].open) * k;
+    var A = slots[0], B = slots[1];
+    var aOn = A.pts && A.open > 0.02, bOn = B.pts && B.open > 0.02;
+    var link = (A.pts && B.pts) ? Math.min(A.open, B.open) : 0;
+    var u = Math.max(1, Math.min(W, H) / 520), t = now / 1000;
+    var g = H * 3, step = Math.min(dt, 1 / 30) / 2;
+
+    /* physics */
+    var s;
+    for (i = 0; i < 2; i++) {
+      s = slots[i];
+      if (!s.pts || s.open <= 0.02) { s.dInit = false; continue; }
+      if (!s.dInit) {
+        for (j = 0; j < 5; j++) {
+          var tp = s.pts[TIPS[j]];
+          ropeReset(s.dang[j], tp, { x: tp.x, y: tp.y + H * 0.1 });
+        }
+        s.dInit = true;
+      }
+      for (j = 0; j < 5; j++) {
+        for (var sub = 0; sub < 2; sub++) ropeStep(s.dang[j], s.pts[TIPS[j]], null, H * 0.1, step, g);
+      }
+    }
+    if (link > 0.02) {
+      if (!cInit) {
+        for (j = 0; j < 5; j++) ropeReset(cables[j], A.pts[TIPS[j]], B.pts[TIPS[j]]);
+        cInit = true;
+      }
+      for (j = 0; j < 5; j++) {
+        var ta = A.pts[TIPS[j]], tb = B.pts[TIPS[j]];
+        var d = Math.hypot(tb.x - ta.x, tb.y - ta.y);
+        var total = Math.max(d * 1.2, d + H * 0.04);
+        for (var sb = 0; sb < 2; sb++) ropeStep(cables[j], ta, tb, total, step, g);
+      }
+    } else cInit = false;
+
+    /* draw */
+    if (!aOn && !bOn) return;
+    nctx.globalCompositeOperation = 'lighter';
+    nctx.lineCap = 'round';
+    nctx.lineJoin = 'round';
+    if (aOn) drawHandWires(A, t, u);
+    if (bOn) drawHandWires(B, t, u);
+    if (link > 0.02) {
+      for (j = 0; j < 5; j++) {
+        neonStroke(cables[j].p, u, link, 1.1, true);
+        neonDot(cables[j].p[0].x, cables[j].p[0].y, 4 * u, link);
+        neonDot(cables[j].p[cables[j].n - 1].x, cables[j].p[cables[j].n - 1].y, 4 * u, link);
+      }
+    }
+    nctx.globalCompositeOperation = 'source-over';
+    nctx.globalAlpha = 1;
+  }
+  requestAnimationFrame(frame);
+
+  /* ---------- Hand tracking ---------- */
+  function onResults(res) {
+    if (!ready) { ready = true; statusEl.classList.add('hidden'); }
+    updateSlots(res.multiHandLandmarks || []);
+  }
+
+  function initHands() {
+    if (typeof Hands === 'undefined') {
+      statusEl.textContent = 'Hand tracking failed to load';
+      return false;
+    }
+    hands = new Hands({
+      locateFile: function (f) { return 'https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/' + f; }
+    });
+    hands.setOptions({ maxNumHands: 2, modelComplexity: 0, minDetectionConfidence: 0.6, minTrackingConfidence: 0.5 });
+    hands.onResults(onResults);
+    return true;
+  }
+
+  function track() {
+    if (!running) return;
+    if (video.readyState >= 2 && !busy) {
+      busy = true;
+      hands.send({ image: video }).catch(function () {}).then(function () { busy = false; });
+    }
+    requestAnimationFrame(track);
+  }
+
+  /* ---------- Camera ---------- */
+  function fail(msg) {
+    errEl.textContent = msg;
+    openBtn.disabled = false;
+    openBtn.textContent = 'Open Camera';
+  }
+
+  openBtn.addEventListener('click', function () {
+    errEl.textContent = '';
+    openBtn.disabled = true;
+    openBtn.textContent = 'Opening camera...';
+
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      fail('Camera is not available. Open this page over https or localhost in a modern browser.');
+      return;
+    }
+
+    navigator.mediaDevices.getUserMedia({
+      video: { facingMode: 'user', width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30 } },
+      audio: false
+    }).then(function (stream) {
+      startEl.classList.add('hidden');
+      appEl.classList.remove('hidden');
+      video.srcObject = stream;
+      return video.play();
+    }).then(function () {
+      layout();
+      if (initHands()) { running = true; track(); }
+    }).catch(function (e) {
+      appEl.classList.add('hidden');
+      startEl.classList.remove('hidden');
+      var denied = e && (e.name === 'NotAllowedError' || e.name === 'SecurityError');
+      fail(denied
+        ? 'Camera access was blocked. Allow camera permission in your browser, then try again.'
+        : 'Could not start the camera. Check that no other app is using it, then try again.');
+    });
+  });
+
+  /* ---------- Keyboard shortcuts (no buttons on screen): F = fullscreen, S = screenshot ---------- */
+  function toggleFullscreen() {
+    var el = document.documentElement;
+    var inFs = document.fullscreenElement || document.webkitFullscreenElement;
+    if (inFs) (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+    else if (el.requestFullscreen || el.webkitRequestFullscreen) (el.requestFullscreen || el.webkitRequestFullscreen).call(el);
+  }
+
+  function screenshot() {
+    if (!W) return;
+    var out = document.createElement('canvas');
+    out.width = Math.round(W * DPR);
+    out.height = Math.round(H * DPR);
+    var c = out.getContext('2d');
+    c.fillStyle = '#000';
+    c.fillRect(0, 0, out.width, out.height);
+    c.save();
+    c.translate(out.width, 0);
+    c.scale(-1, 1);
+    var cv = cover(), sw = W / cv.sc, sh = H / cv.sc;
+    c.drawImage(video, (cv.vw - sw) / 2, (cv.vh - sh) / 2, sw, sh, 0, 0, out.width, out.height);
+    c.restore();
+    c.drawImage(neonCv, 0, 0, out.width, out.height);
+    out.toBlob(function (blob) {
+      if (!blob) return;
+      var a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'neon-hands.png';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(function () { URL.revokeObjectURL(a.href); }, 1000);
+    }, 'image/png');
+  }
+
+  document.addEventListener('keydown', function (e) {
+    if (appEl.classList.contains('hidden') || e.metaKey || e.ctrlKey || e.altKey) return;
+    var key = e.key.toLowerCase();
+    if (key === 'f') toggleFullscreen();
+    else if (key === 's') screenshot();
+  });
+})();
+</script>
+</body>
+</html>
